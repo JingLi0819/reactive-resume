@@ -228,23 +228,29 @@ volumes:
   </Step>
 
   <Step title="Start the stack">
-    <CodeGroup>
+    Start the services and wait for PostgreSQL and Reactive Resume to become healthy:
 
-```bash
-docker compose up -d
-```
+    ```bash
+    docker compose up -d --wait --wait-timeout 180
+    ```
 
-```bash
-docker compose ps
-```
+    The `--wait` option makes Docker Compose wait until the services are running and healthy before returning.
+    The `--wait-timeout 180` option gives the stack up to 180 seconds to become ready.
 
-```bash
-docker compose logs -f reactive-resume
-```
+    When the command succeeds, Reactive Resume should be available at your `APP_URL` (for the example above:
+    `http://localhost:3000`).
 
-    </CodeGroup>
+    If the command times out or exits with an error, check the service status:
 
-    Reactive Resume should now be available at your `APP_URL` (for the example above: `http://localhost:3000`).
+    ```bash
+    docker compose ps
+    ```
+
+    Then inspect the Reactive Resume logs:
+
+    ```bash
+    docker compose logs --tail=50 reactive-resume
+    ```
 
   </Step>
 </Steps>
