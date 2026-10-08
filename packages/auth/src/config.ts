@@ -5,45 +5,30 @@ import { drizzleAdapter } from "@better-auth/drizzle-adapter";
 import { dash } from "@better-auth/infra";
 import { oauthProvider } from "@better-auth/oauth-provider";
 import { passkey } from "@better-auth/passkey";
-import { compare, hash } from "bcrypt";
+import { compare, hash } from "bcryptjs";
 import { APIError, betterAuth } from "better-auth";
 import { createAuthMiddleware } from "better-auth/api";
-import { verifyBearerToken } from "better-auth/oauth2";
-import { admin, jwt } from "better-auth/plugins";
+import { admin, jwt, openAPI } from "better-auth/plugins";
 import { genericOAuth } from "better-auth/plugins/generic-oauth";
 import { twoFactor } from "better-auth/plugins/two-factor";
 import { username } from "better-auth/plugins/username";
+import { and, eq, gt } from "drizzle-orm";
+import { createLocalJWKSet, jwtVerify } from "jose";
 import { createElement } from "react";
 import { db } from "@reactive-resume/db/client";
 import * as schema from "@reactive-resume/db/schema";
 import { ResetPasswordEmail, VerifyEmail, VerifyEmailChange } from "@reactive-resume/email/templates/auth";
 import { sendEmail } from "@reactive-resume/email/transport";
 import { env } from "@reactive-resume/env/server";
-import { rateLimitConfig, TRUSTED_IP_HEADERS } from "@reactive-resume/utils/rate-limit";
+import { rateLimitConfig } from "@reactive-resume/utils/rate-limit";
 import { generateId, toUsername } from "@reactive-resume/utils/string";
 import { isAllowedOAuthRedirectUri } from "@reactive-resume/utils/url-security.node";
 import { createGithubProfileMapper, createProfileMapper } from "./oauth-profile";
+import { authRateLimitStorage } from "./rate-limit";
 import { getTrustedOrigins } from "./trusted-origins";
 
 const authBaseUrl = env.APP_URL;
 const isRateLimitEnabled = process.env.NODE_ENV === "production" && !env.FLAG_DISABLE_API_RATE_LIMIT;
-
-// JWKS must be reachable from inside the Node runtime. `authBaseUrl` is the
-// publicly-visible URL — under Docker port-mapping or behind a reverse proxy
-// it does not loop back to the app process. Override with `BETTER_AUTH_INTERNAL_URL`
-// for split deployments or custom servers that bind to a port not exposed via `PORT`.
-function resolveInternalBaseUrl(): string {
-	const configured = process.env.BETTER_AUTH_INTERNAL_URL?.trim();
-	if (configured) {
-		return configured.replace(/\/+$/, "");
-	}
-
-	const port = process.env.NODE_ENV === "production" ? (process.env.PORT ?? "3000") : String(env.SERVER_PORT);
-
-	return `http://127.0.0.1:${port}`;
-}
-
-const internalBaseUrl = resolveInternalBaseUrl();
 
 const oauthAudienceBase = authBaseUrl.replace(/\/$/, "");
 // These identify the same account-wide API/MCP resource, not separate permission
@@ -56,17 +41,59 @@ const OAUTH_AUDIENCES = [
 	`${oauthAudienceBase}/mcp/`,
 ];
 
-export function verifyOAuthToken(token: string): Promise<JWTPayload> {
-	return verifyBearerToken(token, {
-		jwksUrl: `${internalBaseUrl}/api/auth/jwks`,
-		verifyOptions: {
-			issuer: `${authBaseUrl}/api/auth`,
-			audience: OAUTH_AUDIENCES,
-		},
+export async function verifyOAuthToken(token: string): Promise<JWTPayload> {
+	// Use the same in-process verification on Docker and Vercel. Access tokens must
+	// identify a live client/grant and cannot use proof binding without a DPoP proof.
+	const { payload } = await jwtVerify(token, createLocalJWKSet(await auth.api.getJwks()), {
+		issuer: `${authBaseUrl}/api/auth`,
+		audience: OAUTH_AUDIENCES,
+		requiredClaims: ["sub", "exp", "iat", "azp"],
 	});
+	if (payload.cnf || typeof payload.sub !== "string" || typeof payload.azp !== "string") {
+		throw new APIError("UNAUTHORIZED", { message: "Invalid bearer token." });
+	}
+	const [client] = await db
+		.select()
+		.from(schema.oauthClient)
+		.where(eq(schema.oauthClient.clientId, payload.azp))
+		.limit(1);
+	if (!client || client.disabled)
+		throw new APIError("UNAUTHORIZED", { message: "OAuth client is disabled or deleted." });
+	if (payload.sid !== undefined) {
+		if (typeof payload.sid !== "string") throw new APIError("UNAUTHORIZED", { message: "Invalid token session." });
+		const [session] = await db
+			.select()
+			.from(schema.session)
+			.where(
+				and(
+					eq(schema.session.id, payload.sid),
+					eq(schema.session.userId, payload.sub),
+					gt(schema.session.expiresAt, new Date()),
+				),
+			)
+			.limit(1);
+		if (!session) throw new APIError("UNAUTHORIZED", { message: "OAuth session has ended." });
+	}
+	const [consent] = await db
+		.select()
+		.from(schema.oauthConsent)
+		.where(and(eq(schema.oauthConsent.clientId, payload.azp), eq(schema.oauthConsent.userId, payload.sub)))
+		.limit(1);
+	const scopes = typeof payload.scope === "string" ? payload.scope.split(/\s+/).filter(Boolean) : [];
+	if (
+		!consent ||
+		(payload.rr_grant_id !== undefined
+			? payload.rr_grant_id !== consent.id
+			: consent.createdAt && Math.floor(consent.createdAt.getTime() / 1000) >= Number(payload.iat)) ||
+		(!scopes.some((scope) => scope.startsWith("api:")) && consent.scopes.some((scope) => scope.startsWith("api:"))) ||
+		scopes.some((scope) => !consent.scopes.includes(scope))
+	) {
+		throw new APIError("UNAUTHORIZED", { message: "OAuth access has been revoked. Reconnect the application." });
+	}
+	return payload;
 }
 
-function isCustomOAuthProviderEnabled() {
+export function isCustomOAuthProviderEnabled() {
 	const hasDiscovery = Boolean(env.OAUTH_DISCOVERY_URL);
 	const hasManual =
 		Boolean(env.OAUTH_AUTHORIZATION_URL) && Boolean(env.OAUTH_TOKEN_URL) && Boolean(env.OAUTH_USER_INFO_URL);
@@ -152,12 +179,55 @@ const getAuthConfig = () => {
 		trustedOrigins: TRUSTED_ORIGINS,
 		rateLimit: {
 			...rateLimitConfig.betterAuth.global,
+			...(authRateLimitStorage ? { customStorage: authRateLimitStorage } : {}),
 			enabled: isRateLimitEnabled,
 		},
 
 		hooks: {
-			// biome-ignore lint/suspicious/useAwait: Better Auth requires middleware callbacks to return a Promise.
 			before: createAuthMiddleware(async (ctx) => {
+				if (ctx.path === "/oauth2/delete-consent") {
+					const origin = ctx.headers?.get("origin");
+					if (
+						(origin && origin !== new URL(authBaseUrl).origin) ||
+						ctx.headers?.get("sec-fetch-site") === "cross-site"
+					) {
+						throw new APIError("FORBIDDEN", { message: "Cross-origin consent changes are not allowed." });
+					}
+					const current = await auth.api.getSession({
+						headers: ctx.headers ?? new Headers(),
+						query: { disableCookieCache: true },
+					});
+					const id = ctx.body?.id;
+					if (!current || typeof id !== "string") throw new APIError("UNAUTHORIZED");
+					const [consent] = await db
+						.select()
+						.from(schema.oauthConsent)
+						.where(and(eq(schema.oauthConsent.id, id), eq(schema.oauthConsent.userId, current.user.id)))
+						.limit(1);
+					if (!consent) throw new APIError("NOT_FOUND");
+					// Native consent deletion alone leaves refresh tokens usable. Revoke
+					// the grant's stored tokens before removing its consent.
+					const revoked = new Date();
+					await db
+						.update(schema.oauthRefreshToken)
+						.set({ revoked })
+						.where(
+							and(
+								eq(schema.oauthRefreshToken.clientId, consent.clientId),
+								eq(schema.oauthRefreshToken.userId, current.user.id),
+							),
+						);
+					await db
+						.update(schema.oauthAccessToken)
+						.set({ revoked })
+						.where(
+							and(
+								eq(schema.oauthAccessToken.clientId, consent.clientId),
+								eq(schema.oauthAccessToken.userId, current.user.id),
+							),
+						);
+					return;
+				}
 				if (!ctx.path.includes("/oauth2/register")) return;
 
 				const body = ctx.body as { redirect_uris?: unknown } | undefined;
@@ -188,7 +258,7 @@ const getAuthConfig = () => {
 		advanced: {
 			database: { generateId },
 			useSecureCookies: authBaseUrl.startsWith("https://"),
-			ipAddress: { ipAddressHeaders: TRUSTED_IP_HEADERS },
+			ipAddress: { ipAddressHeaders: ["X-Real-IP"] },
 		},
 
 		emailAndPassword: {
@@ -290,13 +360,14 @@ const getAuthConfig = () => {
 		},
 
 		plugins: [
+			openAPI({ disableDefaultReference: true }),
 			jwt(),
 			admin(),
 			passkey(),
 			genericOAuth({ config: authConfigs }),
 			twoFactor({ issuer: "Reactive Resume" }),
 			apiKey({
-				enableSessionForAPIKeys: true,
+				enableSessionForAPIKeys: false,
 				rateLimit: {
 					...rateLimitConfig.betterAuth.apiKey,
 					enabled: isRateLimitEnabled,
@@ -305,6 +376,24 @@ const getAuthConfig = () => {
 			oauthProvider({
 				loginPage: "/api/auth/oauth",
 				consentPage: "/auth/consent",
+				scopes: ["openid", "profile", "email", "offline_access", "api:read", "api:write", "api:delete"],
+				extensions: [
+					{
+						claims: {
+							accessToken: async ({ user, client }) => {
+								if (!user) return {};
+								const [consent] = await db
+									.select({ id: schema.oauthConsent.id })
+									.from(schema.oauthConsent)
+									.where(
+										and(eq(schema.oauthConsent.clientId, client.clientId), eq(schema.oauthConsent.userId, user.id)),
+									)
+									.limit(1);
+								return { rr_grant_id: consent?.id ?? null };
+							},
+						},
+					},
+				],
 				resources: OAUTH_AUDIENCES,
 				clientRegistrationDefaultResources: OAUTH_AUDIENCES,
 				allowDynamicClientRegistration: true,
@@ -329,4 +418,30 @@ const getAuthConfig = () => {
 	});
 };
 
-export const auth = getAuthConfig();
+type Auth = ReturnType<typeof getAuthConfig>;
+
+let authInstance: Auth | undefined;
+
+function getAuthInstance(): Auth {
+	if (authInstance) return authInstance;
+
+	const instance = getAuthConfig();
+	authInstance = instance;
+	// A rejected Better Auth context cannot recover. Let the next request rebuild it.
+	void instance.$context.catch(() => {
+		if (authInstance === instance) authInstance = undefined;
+	});
+	return instance;
+}
+
+// Keep initialization inside a request or explicit deployment preparation, not module evaluation.
+export const auth: Auth = new Proxy({} as Auth, {
+	get(_target, property) {
+		const instance = getAuthInstance();
+		return Reflect.get(instance, property, instance);
+	},
+});
+
+export async function initializeAuth(): Promise<void> {
+	await auth.$context;
+}

@@ -1,5 +1,4 @@
 import type z from "zod";
-import { t } from "@lingui/core/macro";
 import { Trans } from "@lingui/react/macro";
 import { pageSchema } from "@reactive-resume/schema/resume/data";
 import { FormControl, FormItem, FormLabel, FormMessage } from "@reactive-resume/ui/components/form";
@@ -10,12 +9,10 @@ import {
 	InputGroupText,
 } from "@reactive-resume/ui/components/input-group";
 import { Switch } from "@reactive-resume/ui/components/switch";
-import { Combobox } from "@/components/ui/combobox";
-import { getLocaleOptions } from "@/features/locale/locale-options";
-import { useResume, useUpdateResumeData } from "@/features/resume/builder/draft";
+import { SectionBase } from "../shared/section-base";
+import { useCurrentResume, useUpdateResumeData } from "@/features/resume/builder/draft";
 import { useSyncFormValues } from "@/hooks/use-sync-form-values";
 import { useAppForm } from "@/libs/tanstack-form";
-import { SectionBase } from "../shared/section-base";
 
 export function PageSectionBuilder() {
 	return (
@@ -35,8 +32,8 @@ const CLAMP_MAX = 100;
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 function PageSectionForm() {
-	const resume = useResume();
-	const page = resume?.data.metadata.page;
+	const resume = useCurrentResume();
+	const page = resume.data.metadata.page;
 	const updateResumeData = useUpdateResumeData();
 
 	const persist = (data: FormValues) => {
@@ -78,71 +75,13 @@ function PageSectionForm() {
 
 	return (
 		<form
-			className="grid @md:grid-cols-2 grid-cols-1 gap-4"
+			className="grid grid-cols-1 gap-4 @md:grid-cols-2"
 			onSubmit={(event) => {
 				event.preventDefault();
 				event.stopPropagation();
 				void form.handleSubmit();
 			}}
 		>
-			<form.Field name="locale">
-				{(field) => (
-					<FormItem
-						className="col-span-full"
-						hasError={field.state.meta.isTouched && field.state.meta.errors.length > 0}
-					>
-						<FormLabel>
-							<Trans>Language</Trans>
-						</FormLabel>
-						<FormControl
-							render={
-								<Combobox
-									options={getLocaleOptions()}
-									value={field.state.value}
-									onValueChange={(locale) => {
-										const value = (locale ?? "") as string;
-										field.handleChange(value);
-										handleAutoSave("locale", value);
-									}}
-								/>
-							}
-						/>
-						<FormMessage errors={field.state.meta.errors} />
-					</FormItem>
-				)}
-			</form.Field>
-
-			<form.Field name="format">
-				{(field) => (
-					<FormItem
-						className="col-span-full"
-						hasError={field.state.meta.isTouched && field.state.meta.errors.length > 0}
-					>
-						<FormLabel>
-							<Trans context="Page Format (A4, Letter, Free-form)">Format</Trans>
-						</FormLabel>
-						<FormControl
-							render={
-								<Combobox
-									options={[
-										{ value: "a4", label: t`A4` },
-										{ value: "letter", label: t`Letter` },
-										{ value: "free-form", label: t`Free-form` },
-									]}
-									value={field.state.value}
-									onValueChange={(value) => {
-										const format = value as FormValues["format"];
-										field.handleChange(format);
-										handleAutoSave("format", format);
-									}}
-								/>
-							}
-						/>
-						<FormMessage errors={field.state.meta.errors} />
-					</FormItem>
-				)}
-			</form.Field>
-
 			{pageNumberFields.map(({ name, label, min, max }) => (
 				<form.Field key={name} name={name}>
 					{(field) => (

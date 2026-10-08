@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import { dirname, extname, join } from "node:path";
 import {
@@ -10,6 +11,7 @@ import {
 import sharp from "sharp";
 import { env } from "@reactive-resume/env/server";
 import { getLocalDataDirectory } from "@reactive-resume/utils/monorepo.node";
+import { BlobStorageService } from "./blob";
 
 interface StorageWriteInput {
 	key: string;
@@ -26,7 +28,7 @@ interface StorageReadResult {
 	contentType?: string;
 }
 
-interface StorageService {
+export interface StorageService {
 	list(prefix: string): Promise<string[]>;
 	write(input: StorageWriteInput): Promise<void>;
 	read(key: string): Promise<StorageReadResult | null>;
@@ -36,7 +38,7 @@ interface StorageService {
 
 interface StorageHealthResult {
 	status: "healthy" | "unhealthy";
-	type: "local" | "s3";
+	type: "local" | "s3" | "blob" | "r2";
 	message: string;
 	error?: string;
 }
@@ -69,7 +71,7 @@ const EXTENSION_BY_CONTENT_TYPE: Record<string, string> = {
 // mapped, not just JPEG. Non-image uploads (e.g. a cover-letter PDF) get their real extension.
 function buildFileKey(userId: string, contentType: string): string {
 	const extension = EXTENSION_BY_CONTENT_TYPE[contentType] ?? "bin";
-	return `uploads/${userId}/pictures/${Date.now()}.${extension}`;
+	return `uploads/${userId}/pictures/${randomUUID()}.${extension}`;
 }
 
 function buildPublicUrl(path: string): string {
@@ -138,16 +140,16 @@ class LocalStorageService implements StorageService {
 	}
 
 	async write({ key, data, private: isPrivate }: StorageWriteInput): Promise<void> {
-		if (isPrivate) {
+		if (isPrivate && !/^uploads\/[A-Za-z0-9_-]+\/agent\/[A-Za-z0-9_-]+\/[A-Za-z0-9_-]+$/.test(key)) {
 			throw new Error(
-				"Private storage writes are not supported by the local filesystem backend. Configure S3 to store private attachments.",
+				"Private local writes must use the assistant attachment namespace, which public upload routes never serve.",
 			);
 		}
 
 		const fullPath = this.resolvePath(key);
 
 		await fs.mkdir(dirname(fullPath), { recursive: true });
-		await fs.writeFile(fullPath, data);
+		await fs.writeFile(fullPath, data, isPrivate ? { mode: 0o600 } : undefined);
 	}
 
 	async read(key: string): Promise<StorageReadResult | null> {
@@ -324,11 +326,19 @@ class S3StorageService implements StorageService {
 
 let cachedService: StorageService | null = null;
 
+/** Platforms with native storage bindings configure their adapter before handling requests. */
+export function configureStorageService(service: StorageService): void {
+	cachedService = service;
+}
+
 export function getStorageService(): StorageService {
+	if (env.STORAGE_BACKEND === "r2" && !cachedService) throw new Error("R2 storage binding is not configured");
 	cachedService ??=
-		env.S3_ACCESS_KEY_ID && env.S3_SECRET_ACCESS_KEY && env.S3_BUCKET
-			? new S3StorageService()
-			: new LocalStorageService();
+		env.STORAGE_BACKEND === "blob"
+			? new BlobStorageService()
+			: env.STORAGE_BACKEND === "s3"
+				? new S3StorageService()
+				: new LocalStorageService();
 	return cachedService;
 }
 

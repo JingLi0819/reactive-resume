@@ -1,140 +1,67 @@
 // @vitest-environment happy-dom
+// @vitest-environment-options {"url":"https://localhost:3000"}
 
-import { act, render } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { i18n } from "@lingui/core";
+import Cookies from "js-cookie";
+import { Toaster } from "@reactive-resume/ui/components/toast";
 import { DonationToast } from "./donation-toast";
 
-type AddOptions = {
-	actionProps: { children: string; onClick: () => void };
-	description: string;
-	id: string;
-	onClose: () => void;
-	timeout: number;
-	title: string;
-};
+const LAUNCH_START = Date.parse("2026-10-05T07:01:00Z");
+const LAUNCH_END = LAUNCH_START + 24 * 60 * 60 * 1000;
+const FIVE_MINUTES = 5 * 60 * 1000;
+const DISMISSED_COOKIE = "donation-toast-dismissed";
 
-const cookieMock = vi.hoisted(() => ({
-	value: null as string | null,
-	set: vi.fn(),
-}));
+beforeEach(() => {
+	vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout", "requestAnimationFrame", "cancelAnimationFrame"] });
+	i18n.loadAndActivate({ locale: "en-US", messages: {} });
+	Cookies.remove(DISMISSED_COOKIE);
+});
 
-const toastMock = vi.hoisted(() => ({
-	toast: {
-		add: vi.fn(),
-		close: vi.fn(),
-	},
-}));
+afterEach(() => {
+	Cookies.remove(DISMISSED_COOKIE);
+	vi.useRealTimers();
+});
 
-vi.mock("js-cookie", () => ({
-	default: {
-		get: vi.fn(() => cookieMock.value ?? undefined),
-		set: cookieMock.set,
-	},
-}));
+it("hides an existing donation toast when launch starts without recording a dismissal", async () => {
+	vi.setSystemTime(LAUNCH_START - FIVE_MINUTES - 60_000);
+	render(
+		<>
+			<DonationToast />
+			<Toaster />
+		</>,
+	);
 
-vi.mock("@reactive-resume/ui/components/toast", () => ({
-	toast: toastMock.toast,
-}));
+	await act(() => vi.advanceTimersByTimeAsync(FIVE_MINUTES));
+	expect(screen.getByText("Please support the project")).toBeVisible();
 
-const getAddOptions = () => {
-	const call = toastMock.toast.add.mock.calls[0] as [AddOptions] | undefined;
-	if (!call) throw new Error("Donation toast was not shown.");
-	return call[0];
-};
+	await act(() => vi.advanceTimersByTimeAsync(60_000));
+	// Base UI unmounts a closing toast a few animation frames later; leave room for them whatever the clock phase.
+	await act(() => vi.advanceTimersByTimeAsync(100));
+	expect(screen.queryByText("Please support the project")).not.toBeInTheDocument();
+	expect(Cookies.get(DISMISSED_COOKIE)).toBeUndefined();
 
-const SHOW_TOAST_DELAY_MS = 5 * 60 * 1000;
+	await act(() => vi.advanceTimersByTimeAsync(FIVE_MINUTES));
+	expect(screen.queryByText("Please support the project")).not.toBeInTheDocument();
+});
 
-describe("DonationToast", () => {
-	beforeEach(() => {
-		vi.useFakeTimers();
-		vi.setSystemTime(new Date("2026-05-11T12:00:00.000Z"));
-		i18n.loadAndActivate({ locale: "en-US", messages: {} });
-		cookieMock.value = null;
-		cookieMock.set.mockClear();
-		toastMock.toast.add.mockClear();
-		toastMock.toast.close.mockClear();
-		vi.spyOn(window, "open").mockReturnValue(null);
-	});
+it("pauses donation prompts during launch and resumes five minutes after it ends", async () => {
+	vi.setSystemTime(LAUNCH_END - FIVE_MINUTES - 60_000);
+	render(
+		<>
+			<DonationToast />
+			<Toaster />
+		</>,
+	);
 
-	afterEach(() => {
-		vi.restoreAllMocks();
-		vi.useRealTimers();
-	});
+	await act(() => vi.advanceTimersByTimeAsync(FIVE_MINUTES));
+	expect(screen.queryByText("Please support the project")).not.toBeInTheDocument();
+	await act(() => vi.advanceTimersByTimeAsync(60_000));
+	expect(screen.queryByText("Please support the project")).not.toBeInTheDocument();
+	await act(() => vi.advanceTimersByTimeAsync(FIVE_MINUTES));
+	expect(screen.getByText("Please support the project")).toBeVisible();
 
-	it("waits before showing the donation toast", () => {
-		render(<DonationToast />);
-
-		expect(toastMock.toast.add).not.toHaveBeenCalled();
-
-		act(() => {
-			vi.advanceTimersByTime(SHOW_TOAST_DELAY_MS - 1);
-		});
-		expect(toastMock.toast.add).not.toHaveBeenCalled();
-
-		act(() => {
-			vi.advanceTimersByTime(1);
-		});
-
-		expect(toastMock.toast.add).toHaveBeenCalledWith(
-			expect.objectContaining({
-				id: "donation-toast",
-				timeout: 0,
-				title: "Please support the project",
-			}),
-		);
-	});
-
-	it("does not show the toast after it has been dismissed", () => {
-		cookieMock.value = "true";
-
-		render(<DonationToast />);
-
-		act(() => {
-			vi.advanceTimersByTime(SHOW_TOAST_DELAY_MS);
-		});
-
-		expect(toastMock.toast.add).not.toHaveBeenCalled();
-	});
-
-	it("sets a 30-day dismissed cookie when closed", () => {
-		render(<DonationToast />);
-
-		act(() => {
-			vi.advanceTimersByTime(SHOW_TOAST_DELAY_MS);
-		});
-
-		act(() => {
-			getAddOptions().onClose();
-		});
-
-		expect(cookieMock.set).toHaveBeenCalledWith("donation-toast-dismissed", "true", {
-			path: "/",
-			secure: true,
-			sameSite: "lax",
-			expires: new Date("2026-06-10T12:05:00.000Z"),
-		});
-	});
-
-	it("opens Open Collective and closes the toast when donating", () => {
-		render(<DonationToast />);
-
-		act(() => {
-			vi.advanceTimersByTime(SHOW_TOAST_DELAY_MS);
-		});
-
-		const options = getAddOptions();
-		expect(options.actionProps.children).toBe("Donate");
-
-		act(() => {
-			options.actionProps.onClick();
-		});
-
-		expect(window.open).toHaveBeenCalledWith(
-			"https://opencollective.com/reactive-resume/donate",
-			"_blank",
-			"noopener,noreferrer",
-		);
-		expect(toastMock.toast.close).toHaveBeenCalledWith("donation-toast");
-	});
+	fireEvent.click(screen.getByLabelText("Close"));
+	expect(Cookies.get(DISMISSED_COOKIE)).toBe("true");
 });

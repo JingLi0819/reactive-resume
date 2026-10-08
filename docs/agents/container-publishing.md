@@ -6,31 +6,80 @@ The repository is `reactive-resume/reactive-resume`. Docker Hub remains
 
 ## Builds and release safety
 
-`.github/workflows/docker-build.yml` builds AMD64 and ARM64 on matching native Blacksmith
-32-vCPU runners. Blacksmith's persistent Docker builder caches layers and cache mounts;
-the architecture-specific cache keys keep the two builders separate.
+`.github/workflows/docker-build.yml` builds AMD64 and ARM64 on matching native runners.
+All workflows run on GitHub-hosted runners (`ubuntu-latest`, `ubuntu-24.04-arm`) by default,
+so forks work without setup. Setting the repository variable `USE_BLACKSMITH=true` switches
+every job to Blacksmith runners (32 vCPU for build/test jobs, 2 vCPU for lightweight jobs) and
+swaps in `useblacksmith/checkout`, `useblacksmith/setup-docker-builder`, and
+`useblacksmith/build-push-action`. Because `uses:` cannot be an expression, each swapped
+action is a pair of steps gated on the variable; keep both halves in sync when editing.
 
-| Trigger | Published aliases | Production deployment |
-| --- | --- | --- |
-| Push to `main` | `sha-*`, `nightly`, timestamped nightly | No |
-| Manual dispatch, default `release=false` | `sha-*`, `canary-<run-id>-<attempt>` | No |
-| Push of a `v*` tag or explicit `release=true` | `sha-*`, `latest`, version/major/minor | Yes: SSH redeploy and Cloudflare purge |
+On GitHub-hosted runners, Docker Buildx shares its local cache between steps within a job and
+no cache is persisted between workflow runs. On Blacksmith, the builder persists layers and the
+Dockerfile's pnpm cache mounts between runs, keyed per architecture (`Dockerfile-amd64`,
+`Dockerfile-arm64`).
 
-Manual `release=true` republishes the version already in `package.json` and redeploys
-production. It does not create a Git tag, GitHub release, or version bump. Use this for
-an approved current-version rebuild; it replaces the existing stable image aliases.
+| Trigger                                         | Action                     | Published aliases                                      | Production deployment                              |
+| ----------------------------------------------- | -------------------------- | ------------------------------------------------------ | -------------------------------------------------- |
+| Push to `main`                                  | Build AMD64 and ARM64      | `sha-<full-commit>`, `nightly`, timestamped nightly    | No                                                 |
+| Manual dispatch, default `release=false`        | Build AMD64 and ARM64      | `sha-<full-commit>`, `canary-<run-id>-<attempt>`       | No                                                 |
+| Push of a stable `v*` tag                       | Promote existing SHA image | `latest`, version/major/minor (`v6.0.0`, `v6.0`, `v6`) | When configured: SSH redeploy and Cloudflare purge |
+| Push of a prerelease `v*` tag                   | Promote existing SHA image | Prerelease version only (for example, `v6.0.0-rc.1`)   | No                                                 |
+| Manual dispatch, `release=true`, branch         | Promote existing SHA image | `latest`                                               | When configured: SSH redeploy and Cloudflare purge |
+| Manual dispatch, `release=true`, stable tag     | Promote existing SHA image | `latest`, version/major/minor (`v6.0.0`, `v6.0`, `v6`) | When configured: SSH redeploy and Cloudflare purge |
+| Manual dispatch, `release=true`, prerelease tag | Promote existing SHA image | Prerelease version only                                | No                                                 |
 
-Manual canaries first run a cache-only build on each architecture, then publish, merge,
-and sign both registry images. Run one with:
+Each main push builds its own full commit-SHA image; newer pushes do not cancel earlier
+builds. An older build still publishes its SHA and timestamped nightly aliases, but only
+the current main HEAD updates the moving `nightly` alias. Architecture-specific build
+outputs use `sha-<full-commit>-amd64` and `sha-<full-commit>-arm64`.
+
+Release tags must be `vMAJOR.MINOR.PATCH`, optionally with a prerelease suffix, and match
+`package.json` at the tagged commit. Promotion resolves that commit's
+`sha-<full-commit>` image independently in each enabled registry, validates both architectures,
+and copies the complete image index within that registry. It adds no annotations and checks
+that each resulting alias has the source digest. Embedded SBOM/provenance manifests and
+existing digest-addressed signatures stay intact; the workflow also signs the promoted digest.
+
+If the main build is still running, promotion waits up to 35 minutes for the source images.
+Missing images or incomplete indexes fail before aliases move; promotion never falls back to
+a rebuild. For an unpublished commit on a ref containing this workflow version, run a
+manual `release=false` build at that ref first, then rerun promotion. Historical refs with
+older workflow files still run their original workflow; their short SHA tags are not promotion
+sources. Keep full SHA images in registry retention policies so commits remain promotable.
+
+Manual `release=true` on main or another branch updates `latest` only, keeping semver
+aliases tied to Git releases. To update `latest` to main without rebuilding:
+
+```bash
+gh workflow run docker-build.yml --repo reactive-resume/reactive-resume --ref main -f release=true
+```
+
+To re-promote an existing stable release, select its Git tag. This updates `latest` and
+that release's full/minor/major semver aliases. The tag must match the built `package.json`
+version. Prerelease tags update only their prerelease alias and skip production integrations.
+
+```bash
+gh workflow run docker-build.yml --repo reactive-resume/reactive-resume --ref v6.0.1 -f release=true
+```
+
+SSH redeployment requires `SSH_KEY`, `SSH_HOST`, and `SSH_USER`; Cloudflare purging requires
+`CLOUDFLARE_ZONE_ID` and `CLOUDFLARE_API_TOKEN`. Each integration is skipped if any required
+secret is missing. Dispatch does not create a Git tag, GitHub release, or version bump.
+
+Manual canaries build, publish, merge, and sign images in enabled registries without
+running production integrations:
 
 ```bash
 gh workflow run docker-build.yml --repo reactive-resume/reactive-resume --ref main -f release=false
 ```
 
-Both registries retain SBOMs, maximum provenance, and Cosign signatures. Publishing uses
-`DOCKER_USERNAME` / `DOCKER_PASSWORD` for Docker Hub and the destination repository's
-`GITHUB_TOKEN` with `packages: write` for GHCR. New GHCR packages need public visibility,
-repository linkage, and Actions access before consumers can pull anonymously.
+Published images retain SBOMs, maximum provenance, and Cosign signatures. GHCR always uses
+the destination repository's `GITHUB_TOKEN` with `packages: write`. Docker Hub publishing
+is enabled only when both `DOCKER_USERNAME` and `DOCKER_PASSWORD` secrets are present;
+otherwise login, publishing, signing, and verification target GHCR only. Image references
+are normalized to lowercase. New GHCR packages need public visibility, repository linkage,
+and Actions access before consumers can pull anonymously.
 
 ## Verification and historical images
 
@@ -62,7 +111,7 @@ rm -r "$registry_config"
 
 On September 11, 2026, `latest`, `v5`, `v5.3`, and `v5.3.0` were copied to the then-current
 public GHCR package, `ghcr.io/reactive-resume/app`. Both architectures were pulled anonymously; the original Cosign signature,
-SBOMs, provenance, and image digest were verified. The signed Blacksmith canary
+SBOMs, provenance, and image digest were verified. The signed canary
 [`canary-34582818410-1`](https://github.com/reactive-resume/reactive-resume/actions/runs/34582818410)
 also passed on both registries without deploying production.
 
@@ -108,6 +157,5 @@ OIDC trust policies; the repository URL alone does not describe the subject.
 Track availability and supported copied tags in [migration issue #3503](https://github.com/reactive-resume/reactive-resume/issues/3503).
 No database reset, volume deletion, or resume-data migration is required.
 
-References: [Blacksmith Docker caching](https://docs.blacksmith.sh/blacksmith-caching/docker-builds),
-[GitHub package permissions](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages),
+References: [GitHub package permissions](https://docs.github.com/en/packages/learn-github-packages/about-permissions-for-github-packages),
 [Cosign verification](https://docs.sigstore.dev/cosign/verifying/verify/).
